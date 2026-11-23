@@ -82,6 +82,47 @@ fn ball(d: f64) -> Tool {
 }
 
 #[test]
+fn cut_many_matches_cutting_one_move_at_a_time() {
+    // Moves of all kinds (short ramps, long passes, plunges, partly off the stock), cut in one
+    // parallel batch, give the very same heights as cutting them in order.
+    let shape = StockShape::Box { min: Vec3::new(0.0, 0.0, -20.0), max: Vec3::new(60.0, 45.0, 0.0) };
+    let mut seed = 12345u64;
+    let mut rnd = |lo: f64, hi: f64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        lo + (hi - lo) * ((seed >> 11) as f64 / (1u64 << 53) as f64)
+    };
+    let mut segs = Vec::new();
+    for k in 0..3000 {
+        let a = Vec3::new(rnd(-5.0, 65.0), rnd(-5.0, 50.0), rnd(-22.0, 2.0));
+        let len = if k % 3 == 0 { 0.3 } else { 15.0 };
+        let b = if k % 7 == 0 { Vec3::new(a.x, a.y, a.z - 3.0) } else { Vec3::new(a.x + rnd(-len, len), a.y + rnd(-len, len), a.z + rnd(-1.0, 1.0)) };
+        segs.push((a, b));
+    }
+    for tool in [ball(6.0), flat(8.0)] {
+        for with_floor in [false, true] {
+            let mut one = StockMap::new(&shape, 0.25).unwrap();
+            if with_floor {
+                let f = HeightMap::from_fn(one.map.bounds(), 0.25, |p| -15.0 + 0.1 * p.x).unwrap();
+                one.floor = Some(HeightMap {
+                    origin: one.map.origin,
+                    cell: one.map.cell,
+                    nx: one.map.nx,
+                    ny: one.map.ny,
+                    z: f.z[..one.map.z.len()].to_vec(),
+                });
+            }
+            let mut many = one.clone();
+            for (a, b) in &segs {
+                one.cut(&tool, *a, *b);
+            }
+            many.cut_many(&tool, &segs);
+            assert_eq!(one.map.z.len(), many.map.z.len());
+            assert!(one.map.z.iter().zip(&many.map.z).all(|(x, y)| x.to_bits() == y.to_bits()), "{} floor {with_floor}", tool.name);
+        }
+    }
+}
+
+#[test]
 fn rectangle_offsets_grow_and_shrink() {
     let r = rect(Vec2::new(0.0, 0.0), Vec2::new(40.0, 20.0));
     let grown = offset_set(std::slice::from_ref(&r), 5.0, 0.01).unwrap();

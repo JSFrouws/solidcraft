@@ -37,15 +37,24 @@ impl HeightMap {
         Ok(HeightMap { origin: bounds.min, cell, nx, ny, z: vec![fill; total] })
     }
 
-    pub fn from_fn(bounds: Aabb2, cell: f64, mut f: impl FnMut(Vec2) -> f64) -> Result<HeightMap> {
+    /// A map with `f` at every cell's point. The cells are independent: on desktop builds the
+    /// rows are computed on all cores ([`crate::par::rows`]).
+    pub fn from_fn(bounds: Aabb2, cell: f64, f: impl Fn(Vec2) -> f64 + Sync) -> Result<HeightMap> {
         let mut h = HeightMap::new(bounds, cell, 0.0)?;
-        for j in 0..h.ny {
-            for i in 0..h.nx {
-                let p = h.point(i, j);
-                h.z[j * h.nx + i] = f(p);
-            }
-        }
+        h.fill(|_, _, p, _| f(p));
         Ok(h)
+    }
+
+    /// Replaces every cell's height with `f(i, j, point, old height)`, rows in parallel on
+    /// desktop builds. `f` must not depend on other cells of this map.
+    pub fn fill(&mut self, f: impl Fn(usize, usize, Vec2, f64) -> f64 + Sync) {
+        let (origin, cell, nx) = (self.origin, self.cell, self.nx);
+        crate::par::rows(&mut self.z, nx, |j, row| {
+            for (i, z) in row.iter_mut().enumerate() {
+                let p = Vec2::new(origin.x + i as f64 * cell, origin.y + j as f64 * cell);
+                *z = f(i, j, p, *z);
+            }
+        });
     }
 
     pub fn point(&self, i: usize, j: usize) -> Vec2 {

@@ -5799,6 +5799,7 @@ name = "solidcraft-cam"
 version = "0.41.0"
 dependencies = [
  "log",
+ "rayon",
  "serde",
  "serde_json",
  "solidcore-record",

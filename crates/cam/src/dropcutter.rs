@@ -100,11 +100,63 @@ impl DropMesh {
         let mut best: Option<Contact> = None;
         let rc = tool.corner_radius();
         let flat = tool.flat_radius();
+        // Pruning, exact: a surface point at horizontal distance `d` from the axis is touched
+        // with the tip `profile(d)` below it, and the profile never falls as `d` grows, so a
+        // triangle (or a box of them) whose nearest point is `d` away and whose top is `z_max`
+        // cannot put the tip above `z_max - profile(d)`, and cannot touch at all past the tool's
+        // radius. Once a contact is found, everything that cannot beat it is skipped: whole BVH
+        // nodes when the frame is the world's axes moved (3-axis work), single triangles in any
+        // frame. Same result (up to rounding: ties never replaced the first contact).
+        let best_z = std::cell::Cell::new(f64::NEG_INFINITY);
+        let axes_world = frame.x == Vec3::new(1.0, 0.0, 0.0) && frame.y == Vec3::new(0.0, 1.0, 0.0) && frame.z == Vec3::new(0.0, 0.0, 1.0);
+        let o = frame.origin;
+        let gap = |lo: f64, hi: f64, v: f64| {
+            if v < lo {
+                lo - v
+            } else if v > hi {
+                v - hi
+            } else {
+                0.0
+            }
+        };
+        // A lower bound to start from: the contact with the triangles straight under the axis
+        // (a real contact, so the answer is at least that high). Anything that cannot reach it
+        // is skipped from the start; anything that can is still visited in the usual order, so
+        // ties resolve as before.
+        let mut seed = f64::NEG_INFINITY;
+        if axes_world {
+            self.bvh.visit(
+                |b| gap(b.min.x - o.x, b.max.x - o.x, xy.x) == 0.0 && gap(b.min.y - o.y, b.max.y - o.y, xy.y) == 0.0 && b.max.z - o.z >= floor,
+                |t| {
+                    let (Some(tri), Some(n)) = (self.tris.get(t as usize), self.normals.get(t as usize)) else { return };
+                    let l = [frame.to_local(tri[0]), frame.to_local(tri[1]), frame.to_local(tri[2])];
+                    if point_in_triangle_xy(xy, &l)
+                        && let Some(c) = drop_triangle(tool, r, rc, flat, xy, &l, frame.dir_to_local(*n), t)
+                        && c.z >= floor
+                    {
+                        seed = seed.max(c.z);
+                    }
+                },
+            );
+        }
+        let reach = |dx: f64, dy: f64, z_top: f64| -> bool {
+            let d = (dx * dx + dy * dy).sqrt();
+            let bound = z_top - tool.profile(d);
+            d <= r + 1e-9 && bound >= seed && bound > best_z.get()
+        };
         self.bvh.visit(
-            |b| b.meets(&col),
+            |b| {
+                b.meets(&col)
+                    && (!axes_world || reach(gap(b.min.x - o.x, b.max.x - o.x, xy.x), gap(b.min.y - o.y, b.max.y - o.y, xy.y), b.max.z - o.z))
+            },
             |t| {
                 let (Some(tri), Some(n)) = (self.tris.get(t as usize), self.normals.get(t as usize)) else { return };
                 let l = [frame.to_local(tri[0]), frame.to_local(tri[1]), frame.to_local(tri[2])];
+                let (x0, x1) = (l[0].x.min(l[1].x).min(l[2].x), l[0].x.max(l[1].x).max(l[2].x));
+                let (y0, y1) = (l[0].y.min(l[1].y).min(l[2].y), l[0].y.max(l[1].y).max(l[2].y));
+                if !reach(gap(x0, x1, xy.x), gap(y0, y1, xy.y), l[0].z.max(l[1].z).max(l[2].z)) {
+                    return;
+                }
                 let nl = frame.dir_to_local(*n);
                 let c = drop_triangle(tool, r, rc, flat, xy, &l, nl, t);
                 if let Some(c) = c
@@ -112,6 +164,7 @@ impl DropMesh {
                     && best.is_none_or(|b| c.z > b.z)
                 {
                     best = Some(c);
+                    best_z.set(c.z);
                 }
             },
         );

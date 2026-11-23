@@ -783,16 +783,40 @@ impl Context<'_> {
         };
         let cell = self.cell_for(bounds);
         let axial = self.stock_to_leave_axial;
-        let mut map = HeightMap::new(*bounds, cell, floor)?;
-        for j in 0..map.ny {
-            for i in 0..map.nx {
-                let p = map.point(i, j);
-                let z = mesh.drop(tool, &Frame::IDENTITY, p, floor).map_or(floor, |c| c.z + axial);
-                let fz = self.fixture_drop(tool, p, floor).map_or(floor, |c| c.z);
-                map.set(i, j, z.max(fz).max(floor));
+        // The fixtures, as solids the tool keeps clear of (when the operation treats them so).
+        let fixtures_in = self.boundary.avoid_fixtures && self.boundary.fixtures_as_solids && self.fixtures.is_some_and(|f| !f.is_empty());
+        let fixture = |p: Vec2| self.fixture_drop(tool, p, floor).map_or(floor, |c| c.z);
+        // An accelerator (the GPU) when one is installed and takes this tool; else one
+        // drop-cutter query per cell on the CPU, the cells independent, rows on all cores.
+        if tool.is_end_mill()
+            && let Some(acc) = crate::accel::accelerator()
+        {
+            let mut map = HeightMap::new(*bounds, cell, floor)?;
+            if let Some(z) = acc.cl_map(mesh, tool, &map, floor)
+                && z.len() == map.z.len()
+            {
+                for (out, v) in map.z.iter_mut().zip(z) {
+                    *out = if v > floor { (v + axial).max(floor) } else { floor };
+                }
+                // Where the surface is nearly vertical between neighbouring cells (a wall's foot,
+                // an edge running off the part) the height is ill-conditioned: a rounding of the
+                // accelerator's position moves it across the wall. Those cells, about one in a
+                // hundred, are dropped exactly on the CPU.
+                let first = map.clone();
+                let (nx, ny, steep) = (map.nx, map.ny, cell * 4.0);
+                map.fill(|i, j, p, z| {
+                    let near = [(i.wrapping_sub(1), j), (i + 1, j), (i, j.wrapping_sub(1)), (i, j + 1)];
+                    let cliff = near.iter().any(|&(a, b)| a < nx && b < ny && first.get(a, b).is_some_and(|w| (w - z).abs() > steep));
+                    let z = if cliff { mesh.drop(tool, &Frame::IDENTITY, p, floor).map_or(floor, |c| c.z + axial).max(floor) } else { z };
+                    if fixtures_in { z.max(fixture(p)).max(floor) } else { z }
+                });
+                return Ok(map);
             }
         }
-        Ok(map)
+        HeightMap::from_fn(*bounds, cell, |p| {
+            let z = mesh.drop(tool, &Frame::IDENTITY, p, floor).map_or(floor, |c| c.z + axial);
+            z.max(fixture(p)).max(floor)
+        })
     }
 
     /// Drops the tool at `xy` in the operation frame, with the stock to leave applied.

@@ -77,15 +77,11 @@ impl Surface {
         let cell = ctx.cell_for(&b);
         let bounds = b.inflated(cell * 2.0);
         let mut map = ctx.cl_map(tool, &bounds, floor)?;
-        for j in 0..map.ny {
-            for i in 0..map.nx {
-                let p = map.point(i, j);
-                let border = i == 0 || j == 0 || i + 1 == map.nx || j + 1 == map.ny;
-                if border || !polyline::set_contains(&boundary, p) {
-                    map.set(i, j, BLOCKED);
-                }
-            }
-        }
+        let (nx, ny) = (map.nx, map.ny);
+        map.fill(|i, j, p, z| {
+            let border = i == 0 || j == 0 || i + 1 == nx || j + 1 == ny;
+            if border || !polyline::set_contains(&boundary, p) { BLOCKED } else { z }
+        });
         Ok(Surface { boundary, map, floor })
     }
 
@@ -154,16 +150,21 @@ impl Surface {
         free_region_of(&map, z)
     }
 
-    /// Level contours of the CL surface at `z` (where the tool touches the surface at this
-    /// height), as polylines clipped to the unblocked area.
-    fn waterlines(&self, z: f64) -> Vec<Poly> {
-        let clipped = HeightMap {
+    /// The CL map with blocked cells read as the floor, for [`Surface::waterlines_on`]; built
+    /// once for all the levels of an operation.
+    fn clipped(&self) -> HeightMap {
+        HeightMap {
             origin: self.map.origin,
             cell: self.map.cell,
             nx: self.map.nx,
             ny: self.map.ny,
             z: self.map.z.iter().map(|v| if v.is_finite() { *v } else { self.floor }).collect(),
-        };
+        }
+    }
+
+    /// Level contours of the CL surface at `z` (where the tool touches the surface at this
+    /// height), as polylines clipped to the unblocked area; `clipped` from [`Surface::clipped`].
+    fn waterlines_on(&self, clipped: &HeightMap, z: f64) -> Vec<Poly> {
         clipped.contours(z).iter().map(|l| polyline::simplify_closed(l, self.map.cell * 0.3)).filter(|l| l.len() >= 3).collect()
     }
 
@@ -287,19 +288,22 @@ fn pocket3d(
     let rest_margin = ctx.rest.map_or(0.0, |r| (r.cell * 1.5).max(ctx.tolerance * 5.0));
     // Regions per level, each a set of loops; with order_by_depth, regions are grouped by
     // the area they lie in and each area is cut to the bottom before the next.
-    let mut per_level: Vec<(f64, Vec<Poly>)> = Vec::new();
-    let mut roof = top;
-    for z in &zs {
-        // Rest machining cuts only where the earlier operations left material for this tool.
+    // Rest machining cuts only where the earlier operations left material for this tool.
+    // Levels are independent (a level's roof is the level above it): computed in parallel,
+    // kept top down.
+    let idx: Vec<usize> = (0..zs.len()).collect();
+    let per_level: Vec<(f64, Vec<Poly>)> = crate::par::map(&idx, |&k| {
+        let z = zs.get(k).copied().unwrap_or(bottom);
+        let roof = if k == 0 { top } else { zs.get(k - 1).copied().unwrap_or(top) };
         let region = match ctx.rest {
-            Some(rest) => surf.rest_region(rest, ctx.rest_floor, tool.radius(), *z, roof.max(*z + rest_margin * 2.0), rest_margin),
+            Some(rest) => surf.rest_region(rest, ctx.rest_floor, tool.radius(), z, roof.max(z + rest_margin * 2.0), rest_margin),
             None => surf.free_region(z + eps),
         };
-        if !region.is_empty() {
-            per_level.push((*z, region));
-        }
-        roof = *z;
-    }
+        (z, region)
+    })
+    .into_iter()
+    .filter(|(_, region)| !region.is_empty())
+    .collect();
     if order_by_depth {
         // Group by the outer loop at the top level each region's probe falls in.
         let tops: Vec<Poly> = per_level.first().map(|(_, r)| r.iter().filter(|p| polyline::is_ccw(p)).cloned().collect()).unwrap_or_default();
@@ -478,12 +482,12 @@ fn parallel(
     let rows = raster_passes(&surf.boundary, stepover, angle_deg.to_radians(), direction == Direction::Both, ctx.tolerance)?;
     let step = sample_step(ctx);
     let slope_opt = if slope.0 <= 0.0 && slope.1 >= 90.0 { None } else { Some(slope) };
-    let mut passes: Vec<Pass> = Vec::new();
-    for row in &rows {
-        for piece in drop_polyline(ctx, surf, &vtool, row, step, slope_opt) {
-            passes.push(Pass { points: piece, closed: false });
-        }
-    }
+    // Rows are independent: dropped in parallel, kept in raster order.
+    let passes: Vec<Pass> = crate::par::map(&rows, |row| drop_polyline(ctx, surf, &vtool, row, step, slope_opt))
+        .into_iter()
+        .flatten()
+        .map(|piece| Pass { points: piece, closed: false })
+        .collect();
     let lk = linker(op, ctx);
     let mut tp = Toolpath::new();
     run_surface_passes(&lk, &mut tp, &passes, ctx, surf, &vtool, stepover * 2.5)?;
@@ -585,9 +589,11 @@ fn waterline(
         zs.sort_by(|a, b| b.total_cmp(a));
     }
     let slope_opt = if slope.0 <= 0.0 && slope.1 >= 90.0 { None } else { Some(slope) };
-    let mut passes: Vec<Pass> = Vec::new();
-    for z in &zs {
-        for loop_ in surf.waterlines(*z) {
+    // Each level is independent: levels run in parallel and are joined in order, top down.
+    let clipped = surf.clipped();
+    let per_level = crate::par::map(&zs, |z| {
+        let mut passes: Vec<Pass> = Vec::new();
+        for loop_ in surf.waterlines_on(&clipped, *z) {
             let oriented = super::orient_for(&loop_, direction, !polyline::is_ccw(&loop_));
             let mut pts: Vec<Vec3> = oriented.iter().map(|p| Vec3::new(p.x, p.y, *z)).collect();
             if let Some(first) = pts.first().copied() {
@@ -608,7 +614,9 @@ fn waterline(
                 passes.push(Pass { points: simplified, closed: whole });
             }
         }
-    }
+        passes
+    });
+    let passes: Vec<Pass> = per_level.into_iter().flatten().collect();
     let lk = linker(op, ctx);
     let mut tp = Toolpath::new();
     run_surface_passes(&lk, &mut tp, &passes, ctx, surf, &vtool, stepdown * 2.0)?;
