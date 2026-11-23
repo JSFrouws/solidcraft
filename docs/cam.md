@@ -150,6 +150,13 @@ operation whose eye is off in the browser draws no path in the simulation either
 stock has been cut below the model's surface (a gouge) the simulation draws it in red on the
 stock, with a post up to where the surface should be, and its notice gives `gouge_cells`.
 
+Generation and simulation use every CPU core and give the same G-code on every machine. The
+GPU can compute the cutter-location maps and sweep the stock as well (`SOLIDCRAFT_CAM_GPU=1`,
+off by default): it is faster on big parts, but it works in f32, so its G-code can differ by
+micrometres from one GPU to another and from the CPU's. An operation or simulation that used it
+says so with the info issue `accelerated` and names the device in its `accelerator` value. Any
+GPU failure falls back to the CPU.
+
 ## The Manufacture workspace
 
 CAM lives in the **Manufacture** workspace (the workspace switcher at the top left, or
@@ -375,7 +382,7 @@ lists them.
 `shank_collision`, `holder_collision`, `fixture_collision`, `rapid_collision`, `gouge`,
 `unknown_parameter` (with the nearest valid name), `machine_axes` (the machine has fewer axes
 than the operation needs), `not_generated`, `sketch_not_level`, `face_not_level`,
-`hole_not_aligned`, `generation_failed`.
+`hole_not_aligned`, `generation_failed`, `accelerated` (info: the GPU did part of the work).
 
 ## Where things live
 
