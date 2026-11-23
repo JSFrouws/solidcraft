@@ -12,6 +12,7 @@ workspace = true
 solidcraft-viewport-gpu = { workspace = true }
 solidcraft-viewport = { workspace = true }
 solidcore-record = { workspace = true }
+solidcraft-cam = { workspace = true }
 solidcore-tess = { workspace = true }
 robust = "1.2"
 solidcraft-color = { workspace = true }

@@ -5958,6 +5958,7 @@ dependencies = [
  "serde_json",
  "solidcore-record",
  "solidcore-tess",
+ "solidcraft-cam",
  "solidcraft-color",
  "solidcraft-engine",
  "solidcraft-geom",

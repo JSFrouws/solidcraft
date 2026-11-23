@@ -1096,6 +1096,9 @@ fn main() -> eframe::Result {
     solidcraft_look::install_tables();
     solidcraft_ui_egui::workspace::install_tabs();
     solidcraft_ui_egui::navigation_slots::install();
+    // CAM cutter-location maps and stock sweeps on the GPU when there is one (opened on first use).
+    #[cfg(not(target_arch = "wasm32"))]
+    solidcraft_gpu::cam_cl::install_cam_accelerator();
     // On OCLP-patched Macs, wgpu picks a Metal Shading Language standard that the system's
     // compiler refuses (`invalid value 'metal3.2'`), because the patched OS reports a newer
     // macOS version than the GPU's Metal compiler supports. Re-launching with
