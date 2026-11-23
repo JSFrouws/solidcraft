@@ -72,6 +72,17 @@ impl DropMesh {
     /// Drops the tool at local `(x, y)` of `frame` (its z is the tool axis). Returns the tip
     /// height in the frame, or `None` when nothing lies under the tool (down to `floor`).
     pub fn drop(&self, tool: &Tool, frame: &Frame, xy: Vec2, floor: f64) -> Option<Contact> {
+        self.drop_pruned(tool, frame, xy, floor, true)
+    }
+
+    /// [`DropMesh::drop`] visiting every triangle near the tool, without the pruning: the
+    /// reference the pruned drop must match bit for bit (tests).
+    #[cfg(test)]
+    pub(crate) fn drop_unpruned(&self, tool: &Tool, frame: &Frame, xy: Vec2, floor: f64) -> Option<Contact> {
+        self.drop_pruned(tool, frame, xy, floor, false)
+    }
+
+    fn drop_pruned(&self, tool: &Tool, frame: &Frame, xy: Vec2, floor: f64, prune: bool) -> Option<Contact> {
         let r = tool.radius();
         // World box of the tool's vertical column above the floor over the frame.
         let zmax = {
@@ -100,11 +111,65 @@ impl DropMesh {
         let mut best: Option<Contact> = None;
         let rc = tool.corner_radius();
         let flat = tool.flat_radius();
+        // Pruning, exact: a surface point at horizontal distance `d` from the axis is touched
+        // with the tip `profile(d)` below it, and the profile never falls as `d` grows, so a
+        // triangle (or a box of them) whose nearest point is `d` away and whose top is `z_max`
+        // cannot put the tip above `z_max - profile(d)`, and cannot touch at all past the tool's
+        // radius. Once a contact is found, everything that cannot beat it is skipped: whole BVH
+        // nodes when the frame is the world's axes moved (3-axis work), single triangles in any
+        // frame. The bound and the contact heights are computed in different ways, so a contact
+        // can come out a few units in the last place above its bound: anything within
+        // [`PRUNE_SLACK`] of the best is still visited, in the usual order, and a tie still never
+        // replaces the first contact. So the result is the very contact the unpruned search
+        // finds, bit for bit.
+        let best_z = std::cell::Cell::new(f64::NEG_INFINITY);
+        let axes_world = prune && frame.x == Vec3::new(1.0, 0.0, 0.0) && frame.y == Vec3::new(0.0, 1.0, 0.0) && frame.z == Vec3::new(0.0, 0.0, 1.0);
+        let o = frame.origin;
+        let gap = |lo: f64, hi: f64, v: f64| {
+            if v < lo {
+                lo - v
+            } else if v > hi {
+                v - hi
+            } else {
+                0.0
+            }
+        };
+        // A lower bound to start from: the contact with the triangles straight under the axis
+        // (a real contact, so the answer is at least that high). Anything that cannot reach it
+        // is skipped from the start; anything that can is still visited in the usual order, so
+        // ties resolve as before.
+        let mut seed = f64::NEG_INFINITY;
+        if axes_world {
+            self.bvh.visit(
+                |b| gap(b.min.x - o.x, b.max.x - o.x, xy.x) == 0.0 && gap(b.min.y - o.y, b.max.y - o.y, xy.y) == 0.0 && b.max.z - o.z >= floor,
+                |t| {
+                    let (Some(tri), Some(n)) = (self.tris.get(t as usize), self.normals.get(t as usize)) else { return };
+                    let l = [frame.to_local(tri[0]), frame.to_local(tri[1]), frame.to_local(tri[2])];
+                    if point_in_triangle_xy(xy, &l)
+                        && let Some(c) = drop_triangle(tool, r, rc, flat, xy, &l, frame.dir_to_local(*n), t)
+                        && c.z >= floor
+                    {
+                        seed = seed.max(c.z);
+                    }
+                },
+            );
+        }
+        let reach = |dx: f64, dy: f64, z_top: f64| -> bool {
+            !prune || reach_bound(tool, r, dx, dy, z_top).is_some_and(|b| b >= seed - PRUNE_SLACK && b >= best_z.get() - PRUNE_SLACK)
+        };
         self.bvh.visit(
-            |b| b.meets(&col),
+            |b| {
+                b.meets(&col)
+                    && (!axes_world || reach(gap(b.min.x - o.x, b.max.x - o.x, xy.x), gap(b.min.y - o.y, b.max.y - o.y, xy.y), b.max.z - o.z))
+            },
             |t| {
                 let (Some(tri), Some(n)) = (self.tris.get(t as usize), self.normals.get(t as usize)) else { return };
                 let l = [frame.to_local(tri[0]), frame.to_local(tri[1]), frame.to_local(tri[2])];
+                let (x0, x1) = (l[0].x.min(l[1].x).min(l[2].x), l[0].x.max(l[1].x).max(l[2].x));
+                let (y0, y1) = (l[0].y.min(l[1].y).min(l[2].y), l[0].y.max(l[1].y).max(l[2].y));
+                if !reach(gap(x0, x1, xy.x), gap(y0, y1, xy.y), l[0].z.max(l[1].z).max(l[2].z)) {
+                    return;
+                }
                 let nl = frame.dir_to_local(*n);
                 let c = drop_triangle(tool, r, rc, flat, xy, &l, nl, t);
                 if let Some(c) = c
@@ -112,10 +177,36 @@ impl DropMesh {
                     && best.is_none_or(|b| c.z > b.z)
                 {
                     best = Some(c);
+                    best_z.set(c.z);
                 }
             },
         );
         best
+    }
+
+    /// How far any triangle's contact at `xy` (world frame) rises above the bound the pruning
+    /// uses for it: the bound must never be lower than the contact by more than the slack.
+    #[cfg(test)]
+    pub(crate) fn bound_excess(&self, tool: &Tool, xy: Vec2) -> f64 {
+        let (r, rc, flat) = (tool.radius(), tool.corner_radius(), tool.flat_radius());
+        let gap = |lo: f64, hi: f64, v: f64| {
+            if v < lo {
+                lo - v
+            } else if v > hi {
+                v - hi
+            } else {
+                0.0
+            }
+        };
+        let mut worst = f64::NEG_INFINITY;
+        for (t, (l, n)) in self.tris.iter().zip(&self.normals).enumerate() {
+            let Some(c) = drop_triangle(tool, r, rc, flat, xy, l, *n, t as u32) else { continue };
+            let (x0, x1) = (l[0].x.min(l[1].x).min(l[2].x), l[0].x.max(l[1].x).max(l[2].x));
+            let (y0, y1) = (l[0].y.min(l[1].y).min(l[2].y), l[0].y.max(l[1].y).max(l[2].y));
+            let bound = reach_bound(tool, r, gap(x0, x1, xy.x), gap(y0, y1, xy.y), l[0].z.max(l[1].z).max(l[2].z)).unwrap_or(f64::NEG_INFINITY);
+            worst = worst.max(c.z - bound);
+        }
+        worst
     }
 
     /// Drops in the world frame (3-axis).
@@ -157,6 +248,20 @@ impl DropMesh {
         );
         hit.get()
     }
+}
+
+/// How far below the best contact so far a triangle's (or a BVH box's) bound may lie and still
+/// be visited: the bound and the contacts are computed in different ways and differ by a few
+/// units in the last place (tens of femtometres on parts of tens of millimetres); a nanometre
+/// leaves a wide margin and prunes as well.
+pub(crate) const PRUNE_SLACK: f64 = 1e-9;
+
+/// The highest tip height a tool can reach on anything whose nearest point is `(dx, dy)` from
+/// its axis and whose top is `z_top`: the profile never falls as the distance grows, so a point
+/// farther away or lower cannot lift it higher. `None` beyond the tool's radius.
+fn reach_bound(tool: &Tool, r: f64, dx: f64, dy: f64, z_top: f64) -> Option<f64> {
+    let d = (dx * dx + dy * dy).sqrt();
+    (d <= r + PRUNE_SLACK).then(|| z_top - tool.profile(d))
 }
 
 /// The highest tip height at which a tool at `(x, y)` touches the triangle `tri` (local frame,

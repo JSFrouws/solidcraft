@@ -73,12 +73,134 @@ fn sphere_mesh(c: Vec3, r: f64, n: usize) -> Mesh {
     Mesh { positions: pos, normals: Vec::new(), triangles: tris, ..Default::default() }
 }
 
+/// A bumpy height field: `n` x `n` quads over `size` mm, vertices jittered in x and y and set
+/// at random heights (a seeded generator), so the tool rests on vertices and edges as often as
+/// on facets.
+fn terrain_mesh(n: usize, size: f64, seed: u64) -> Mesh {
+    let mut s = seed;
+    let mut rnd = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (s >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let step = size / n as f64;
+    let mut pos = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let jx = if i == 0 || i == n { 0.0 } else { (rnd() - 0.5) * 0.6 * step };
+            let jy = if j == 0 || j == n { 0.0 } else { (rnd() - 0.5) * 0.6 * step };
+            pos.push(Vec3::new(i as f64 * step + jx - size * 0.5, j as f64 * step + jy - size * 0.5, rnd() * 3.0));
+        }
+    }
+    let idx = |i: usize, j: usize| (j * (n + 1) + i) as u32;
+    let mut tris = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            tris.push([idx(i, j), idx(i + 1, j), idx(i + 1, j + 1)]);
+            tris.push([idx(i, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+        }
+    }
+    Mesh { positions: pos, normals: Vec::new(), triangles: tris, ..Default::default() }
+}
+
 fn flat(d: f64) -> Tool {
     Tool::new(1, "flat", ToolKind::FlatEnd, d)
 }
 
 fn ball(d: f64) -> Tool {
     Tool::new(2, "ball", ToolKind::BallEnd, d)
+}
+
+#[test]
+fn the_pruning_bound_never_falls_below_a_contact() {
+    // The drop cutter skips a triangle whose bound (its top less the tool profile at its
+    // nearest point) cannot beat the best contact so far. The contacts are computed another
+    // way and can come out a few units in the last place above the bound (a bull nose on a
+    // sphere does): never by as much as the slack the pruning allows.
+    let bull = Tool::new(3, "bull", ToolKind::BullNose { corner_radius: 2.0 }, 8.0);
+    for (name, mesh) in [("sphere", sphere_mesh(Vec3::new(0.37, -0.21, 1.3), 11.7, 48)), ("terrain", terrain_mesh(20, 40.0, 3))] {
+        let mesh = DropMesh::new(&mesh);
+        for tool in [ball(6.0), bull.clone(), flat(8.0)] {
+            let mut worst = f64::NEG_INFINITY;
+            for i in 0..50 {
+                for j in 0..50 {
+                    let xy = Vec2::new(-22.0 + 44.0 * (i as f64 + 0.37) / 50.0, -22.0 + 44.0 * (j as f64 + 0.61) / 50.0);
+                    worst = worst.max(mesh.bound_excess(&tool, xy));
+                }
+            }
+            assert!(worst <= crate::dropcutter::PRUNE_SLACK * 1e-3, "{name} {}: a contact {worst:e} mm above its bound", tool.name);
+        }
+    }
+}
+
+#[test]
+fn pruned_drop_matches_the_unpruned_one_bit_for_bit() {
+    // Over a sphere on a box (curved faces, flat tops, near-ties everywhere), with a ball, a
+    // bull nose and a flat end mill, straight down and in a tilted frame, the pruned drop finds
+    // the very contact the full search finds: same height to the bit, same triangle.
+    let mut mesh = sphere_mesh(Vec3::new(0.37, -0.21, 4.0), 12.0, 40);
+    mesh.append(&box_mesh(Vec3::new(-25.0, -20.0, -10.0), Vec3::new(25.0, 20.0, 0.0)), 0);
+    let mesh = DropMesh::new(&mesh);
+    let bull = Tool::new(3, "bull", ToolKind::BullNose { corner_radius: 2.0 }, 8.0);
+    let tilted = Frame::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.3, -0.2, 1.0), Vec3::new(1.0, 0.0, 0.0)).unwrap();
+    let n = 60;
+    for tool in [ball(6.0), bull, flat(8.0)] {
+        for frame in [Frame::IDENTITY, tilted] {
+            let mut differ = 0;
+            for i in 0..n {
+                for j in 0..n {
+                    let xy = Vec2::new(-30.0 + 60.0 * i as f64 / (n - 1) as f64, -25.0 + 50.0 * j as f64 / (n - 1) as f64);
+                    let same = match (mesh.drop(&tool, &frame, xy, -40.0), mesh.drop_unpruned(&tool, &frame, xy, -40.0)) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => a.z.to_bits() == b.z.to_bits() && a.triangle == b.triangle,
+                        _ => false,
+                    };
+                    differ += usize::from(!same);
+                }
+            }
+            assert_eq!(differ, 0, "{}: {differ} of {} drops differ", tool.name, n * n);
+        }
+    }
+}
+
+#[test]
+fn cut_many_matches_cutting_one_move_at_a_time() {
+    // Moves of all kinds (short ramps, long passes, plunges, partly off the stock), cut in one
+    // parallel batch, give the very same heights as cutting them in order.
+    let shape = StockShape::Box { min: Vec3::new(0.0, 0.0, -20.0), max: Vec3::new(60.0, 45.0, 0.0) };
+    let mut seed = 12345u64;
+    let mut rnd = |lo: f64, hi: f64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        lo + (hi - lo) * ((seed >> 11) as f64 / (1u64 << 53) as f64)
+    };
+    let mut segs = Vec::new();
+    for k in 0..3000 {
+        let a = Vec3::new(rnd(-5.0, 65.0), rnd(-5.0, 50.0), rnd(-22.0, 2.0));
+        let len = if k % 3 == 0 { 0.3 } else { 15.0 };
+        let b = if k % 7 == 0 { Vec3::new(a.x, a.y, a.z - 3.0) } else { Vec3::new(a.x + rnd(-len, len), a.y + rnd(-len, len), a.z + rnd(-1.0, 1.0)) };
+        segs.push((a, b));
+    }
+    for tool in [ball(6.0), flat(8.0)] {
+        for with_floor in [false, true] {
+            let mut one = StockMap::new(&shape, 0.25).unwrap();
+            if with_floor {
+                let f = HeightMap::from_fn(one.map.bounds(), 0.25, |p| -15.0 + 0.1 * p.x).unwrap();
+                one.floor = Some(HeightMap {
+                    origin: one.map.origin,
+                    cell: one.map.cell,
+                    nx: one.map.nx,
+                    ny: one.map.ny,
+                    z: f.z[..one.map.z.len()].to_vec(),
+                });
+            }
+            let mut many = one.clone();
+            for (a, b) in &segs {
+                one.cut(&tool, *a, *b);
+            }
+            many.cut_many(&tool, &segs);
+            assert_eq!(one.map.z.len(), many.map.z.len());
+            assert!(one.map.z.iter().zip(&many.map.z).all(|(x, y)| x.to_bits() == y.to_bits()), "{} floor {with_floor}", tool.name);
+        }
+    }
 }
 
 #[test]
@@ -229,6 +351,7 @@ fn ctx_2d<'a>(tool: &'a Tool, loops: Vec<Vec<Vec2>>, h: ResolvedHeights) -> Cont
         rest_floor: None,
         boundary: crate::boundary::Plan::fixed(crate::boundary::Source::Selection, crate::boundary::Containment::Outside),
         boundary_cache: Default::default(),
+        accelerated: Default::default(),
     }
 }
 
@@ -377,6 +500,7 @@ fn ctx_3d<'a>(tool: &'a Tool, mesh: &'a DropMesh, h: ResolvedHeights) -> Context
         rest_floor: None,
         boundary: crate::boundary::Plan::fixed(crate::boundary::Source::Stock, crate::boundary::Containment::Outside),
         boundary_cache: Default::default(),
+        accelerated: Default::default(),
     }
 }
 

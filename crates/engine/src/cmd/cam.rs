@@ -2159,6 +2159,7 @@ fn compute(pr: Prepared, rest: Option<&cam::simulate::StockMap>) -> Generated {
         rest_floor: rest_map.and(rest.and_then(|r| r.floor.as_ref())),
         boundary: cam::boundary::Plan::new(&op.boundary, &op.kind, has_selection, has_model, rest_map.is_some()),
         boundary_cache: Default::default(),
+        accelerated: Default::default(),
     };
     let (tp, n) = match cam::ops::generate(&op, &ctx) {
         Ok(x) => x,
@@ -2625,6 +2626,9 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         total.fixture_collisions += rep.fixture_collisions;
         total.swept_moves += rep.swept_moves;
         total.checked_moves += rep.checked_moves;
+        if rep.accelerator.is_some() {
+            total.accelerator.clone_from(&rep.accelerator);
+        }
         total.gouge_cells = total.gouge_cells.max(rep.gouge_cells);
         total.gouge_max_mm = total.gouge_max_mm.max(rep.gouge_max_mm);
         ops_out.push(json!({"id": op.id, "name": op.name, "type": op.kind.type_name(), "report": rep, "notice": rep.notice().to_json(), "stale": is_stale(s, &st, op.id, &g)}));

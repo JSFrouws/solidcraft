@@ -222,6 +222,74 @@ impl StockMap {
         }
     }
 
+    /// [`StockMap::cut`] for many moves of one tool. Lowering a column is a minimum (clamped to
+    /// the column's floor), so the moves' order does not change the result: the map is split
+    /// into bands of rows, each band takes the moves that reach it, and the bands run in
+    /// parallel. The same heights as cutting the moves one by one.
+    pub fn cut_many(&mut self, tool: &Tool, segs: &[(Vec3, Vec3)]) {
+        const BAND: usize = 8;
+        if segs.len() < 32 {
+            for (a, b) in segs {
+                self.cut(tool, *a, *b);
+            }
+            return;
+        }
+        let bottom = self.bottom;
+        let floor = &self.floor;
+        let r = tool.radius();
+        let m = &mut self.map;
+        let (nx, ny, origin, cell) = (m.nx, m.ny, m.origin, m.cell);
+        if nx == 0 || ny == 0 {
+            return;
+        }
+        // The cell window of a move, as `cut` computes it.
+        let window = |a: Vec3, b: Vec3| -> (usize, usize, usize, usize) {
+            let lo = Vec2::new(a.x.min(b.x) - r, a.y.min(b.y) - r);
+            let hi = Vec2::new(a.x.max(b.x) + r, a.y.max(b.y) + r);
+            let i0 = (((lo.x - origin.x) / cell).floor().max(0.0)) as usize;
+            let j0 = (((lo.y - origin.y) / cell).floor().max(0.0)) as usize;
+            let i1 = ((((hi.x - origin.x) / cell).ceil().max(0.0)) as usize).min(nx - 1);
+            let j1 = ((((hi.y - origin.y) / cell).ceil().max(0.0)) as usize).min(ny - 1);
+            (i0, j0, i1, j1)
+        };
+        let bands = ny.div_ceil(BAND);
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); bands];
+        for (k, (a, b)) in segs.iter().enumerate() {
+            let (_, j0, _, j1) = window(*a, *b);
+            if j0 > j1 {
+                continue;
+            }
+            for band in j0 / BAND..=(j1 / BAND).min(bands - 1) {
+                if let Some(l) = lists.get_mut(band) {
+                    l.push(k as u32);
+                }
+            }
+        }
+        crate::par::rows(&mut m.z, nx * BAND, |band, rows| {
+            let Some(list) = lists.get(band) else { return };
+            let jb = band * BAND;
+            let rows_here = rows.len() / nx;
+            for &k in list {
+                let Some(&(a, b)) = segs.get(k as usize) else { continue };
+                let (i0, j0, i1, j1) = window(a, b);
+                let (a2, b2) = (Vec2::new(a.x, a.y), Vec2::new(b.x, b.y));
+                for j in j0.max(jb)..=j1.min(jb + rows_here - 1) {
+                    for i in i0..=i1 {
+                        let p = Vec2::new(origin.x + i as f64 * cell, origin.y + j as f64 * cell);
+                        let Some(z) = lowest_bottom(tool, p, a, b, a2, b2, r) else { continue };
+                        if let Some(cur) = rows.get_mut((j - jb) * nx + i)
+                            && cur.is_finite()
+                            && z < *cur
+                        {
+                            let lo = floor.as_ref().and_then(|f| f.get(i, j)).filter(|z| z.is_finite()).unwrap_or(bottom);
+                            *cur = z.max(lo);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Whether the tool at `a`–`b` (a rapid) would pass through material: the stock is higher
     /// than the tool bottom somewhere under the footprint.
     pub fn rapid_hits(&self, tool: &Tool, a: Vec3, b: Vec3, tol: f64) -> bool {
@@ -357,6 +425,9 @@ pub struct SimulationReport {
     /// Moves simulated as 3-axis sweeps, and moves only collision-checked (tilted axis).
     pub swept_moves: usize,
     pub checked_moves: usize,
+    /// The device that swept the stock when the (opt-in) GPU did; `None` on the CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator: Option<String>,
 }
 
 /// Material left on the part higher than this (mm) counts as uncut, not as finishing stock.
@@ -368,13 +439,7 @@ pub const UNCUT_WARN_MM2: f64 = 4.0;
 pub fn model_map(model: &DropMesh, grid: &HeightMap, floor: f64) -> HeightMap {
     let probe = Tool::new(0, "probe", crate::tool::ToolKind::FlatEnd, 1e-3);
     let mut out = HeightMap { origin: grid.origin, cell: grid.cell, nx: grid.nx, ny: grid.ny, z: vec![floor; grid.z.len()] };
-    for j in 0..grid.ny {
-        for i in 0..grid.nx {
-            let p = grid.point(i, j);
-            let z = model.drop_z(&probe, p, floor).map_or(floor, |c| c.z);
-            out.set(i, j, z);
-        }
-    }
+    out.fill(|_, _, p, _| model.drop_z(&probe, p, floor).map_or(floor, |c| c.z));
     out
 }
 
@@ -488,19 +553,76 @@ pub fn simulate(
         return Ok(rep);
     }
     let z = Vec3::new(0.0, 0.0, 1.0);
+    // An accelerator (the GPU) sweeps the whole program at once when one is installed: cuts,
+    // and rapids checked against the stock as the cuts before them left it. It models flat,
+    // ball and bull-nose ends; other tools stay on the CPU.
+    if let Some(acc) = crate::accel::sweep_accelerator()
+        && tp.moves.len() >= 256
+        && tool.is_end_mill()
+    {
+        let mut cuts: Vec<(Vec3, Vec3)> = Vec::new();
+        let mut rapids: Vec<(usize, Vec3, Vec3)> = Vec::new();
+        let mut prev = start;
+        for m in &tp.moves {
+            if let Some(p) = prev
+                && (m.axis - z).len() < 1e-6
+                && (p - m.to).len() > 0.0
+            {
+                if m.kind == MoveKind::Rapid { rapids.push((cuts.len(), p, m.to)) } else { cuts.push((p, m.to)) }
+            }
+            prev = Some(m.to);
+        }
+        let mut trial = stock.clone();
+        if let Some(hits) = acc.sweep(&mut trial, tool, &cuts, &rapids, tol)
+            && hits.len() == rapids.len()
+        {
+            *stock = trial;
+            rep.accelerator = Some(acc.device_name());
+            rep.rapid_collisions = hits.iter().filter(|h| **h).count();
+            rep.swept_moves = cuts.len();
+            let mut prev = start;
+            for m in &tp.moves {
+                if prev.is_some() && (m.axis - z).len() >= 1e-6 {
+                    rep.checked_moves += 1;
+                    if let Some(mesh) = mesh {
+                        let shank_r = tool.radius_at(tool.flute_length + 0.01);
+                        if mesh.cylinder_hits(m.to, m.axis, shank_r, tool.flute_length, tool.overall_length, 0.0) {
+                            rep.shank_collisions += 1;
+                        }
+                        if tool.holder_diameter > 0.0
+                            && mesh.cylinder_hits(m.to, m.axis, tool.holder_diameter * 0.5, tool.overall_length, tool.overall_length + 50.0, 0.0)
+                        {
+                            rep.holder_collisions += 1;
+                        }
+                    }
+                }
+                if let Some(fx) = fixtures
+                    && meets_fixture(fx, tool, prev, m, (m.axis - z).len() < 1e-6, tol)
+                {
+                    rep.fixture_collisions += 1;
+                }
+                prev = Some(m.to);
+            }
+            return finish_report(stock, model, before, &start_z, tol, rep);
+        }
+    }
     let mut prev = start;
+    // Cuts are applied in batches (in parallel, same result); a rapid sees every cut before it.
+    let mut batch: Vec<(Vec3, Vec3)> = Vec::new();
     for m in &tp.moves {
         let vertical = (m.axis - z).len() < 1e-6;
         if let Some(p) = prev {
             if vertical && (p - m.to).len() > 0.0 {
                 match m.kind {
                     MoveKind::Rapid => {
+                        stock.cut_many(tool, &batch);
+                        batch.clear();
                         if stock.rapid_hits(tool, p, m.to, tol) {
                             rep.rapid_collisions += 1;
                         }
                     }
                     _ => {
-                        stock.cut(tool, p, m.to);
+                        batch.push((p, m.to));
                         rep.swept_moves += 1;
                     }
                 }
@@ -526,6 +648,19 @@ pub fn simulate(
         }
         prev = Some(m.to);
     }
+    stock.cut_many(tool, &batch);
+    finish_report(stock, model, before, &start_z, tol, rep)
+}
+
+/// The volumes, rest material, uncut area and gouges of a finished sweep.
+fn finish_report(
+    stock: &StockMap,
+    model: Option<&HeightMap>,
+    before: f64,
+    start_z: &[f64],
+    tol: f64,
+    mut rep: SimulationReport,
+) -> Result<SimulationReport> {
     let after = stock.volume();
     rep.removed_volume_mm3 = (before - after).max(0.0);
     rep.remaining_volume_mm3 = after;
@@ -549,7 +684,7 @@ pub fn simulate(
         }
         rep.rest_on_part_mm3 = on_part * stock.map.cell * stock.map.cell;
         rep.rest_on_part_max_mm = on_part_max;
-        (rep.uncut_area_mm2, rep.uncut_at) = uncut(stock, &start_z, model, tol);
+        (rep.uncut_area_mm2, rep.uncut_at) = uncut(stock, start_z, model, tol);
         for (i, j, depth) in gouges(stock, model, tol) {
             rep.gouge_cells += 1;
             if depth > gouge_max {
@@ -622,6 +757,10 @@ impl SimulationReport {
         n.value("fixture_collisions", self.fixture_collisions);
         n.value("swept_moves", self.swept_moves);
         n.value("checked_moves", self.checked_moves);
+        if let Some(device) = &self.accelerator {
+            n.value("accelerator", device.clone());
+            n.issue(Issue::info("accelerated", format!("the stock was swept on the GPU ({device}), with heights in f32")));
+        }
         if self.gouge_cells > 0 {
             let at = self.gouge_at.map_or(String::new(), |p| format!(" (deepest at x {:.2}, y {:.2})", p.x, p.y));
             n.issue(
@@ -824,7 +963,10 @@ impl Simulator {
             }
             self.cursor = Cursor { operation: from, move_index: 0, fraction: 0.0 };
         }
-        // Sweep forward.
+        // Sweep forward; an operation's cuts are applied together (in parallel, same result)
+        // before the next operation starts or the sweep stops.
+        let mut pending: Vec<(Vec3, Vec3)> = Vec::new();
+        let mut pending_op = self.cursor.operation;
         let mut guard = 0usize;
         while self.cursor.operation < target.operation
             || (self.cursor.operation == target.operation && (self.cursor.move_index, self.cursor.fraction) < (target.move_index, target.fraction))
@@ -834,6 +976,13 @@ impl Simulator {
                 break;
             }
             let oi = self.cursor.operation;
+            if oi != pending_op {
+                if let Some(t) = self.operations.get(pending_op).map(|o| o.tool.clone()) {
+                    self.stock.cut_many(&t, &pending);
+                }
+                pending.clear();
+                pending_op = oi;
+            }
             let op = &self.operations[oi];
             if self.cursor.move_index == 0 && self.cursor.fraction == 0.0 && self.checkpoints[oi].is_none() {
                 self.checkpoints[oi] = Some(self.stock.clone());
@@ -857,7 +1006,7 @@ impl Simulator {
                 let b = from_pt.lerp(m.to, f1);
                 let vertical = (m.axis - Vec3::new(0.0, 0.0, 1.0)).len() < 1e-6;
                 if vertical && !op.toolpath.laser && m.kind != MoveKind::Rapid && !(m.kind == MoveKind::Retract && m.feed <= 0.0) {
-                    self.stock.cut(&op.tool, a, b);
+                    pending.push((a, b));
                 }
                 self.tip = b;
                 self.axis = m.axis;
@@ -875,6 +1024,9 @@ impl Simulator {
                     break;
                 }
             }
+        }
+        if let Some(t) = self.operations.get(pending_op).map(|o| o.tool.clone()) {
+            self.stock.cut_many(&t, &pending);
         }
         self.time_s = self.time_at(self.cursor);
         Ok(())

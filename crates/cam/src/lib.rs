@@ -23,6 +23,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod accel;
 pub mod analyze;
 pub mod boundary;
 pub mod catalog;
@@ -35,6 +36,7 @@ pub mod load;
 pub mod machine;
 pub mod notice;
 pub mod ops;
+mod par;
 pub mod post;
 
 pub mod offset;

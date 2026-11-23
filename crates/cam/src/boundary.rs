@@ -20,7 +20,7 @@
 //! what was picked, the tool inside it when roughing. Every generated toolpath's notice says which
 //! boundary was used and why.
 
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use solidcore_record::Vec2;
@@ -242,7 +242,7 @@ pub struct Report {
 }
 
 /// A context's boundary, worked out once.
-pub type Cache = OnceCell<std::result::Result<(Vec<Poly>, Report), String>>;
+pub type Cache = OnceLock<std::result::Result<(Vec<Poly>, Report), String>>;
 
 fn name(s: Source) -> &'static str {
     match s {
@@ -412,14 +412,11 @@ fn rest_outline(rest: &HeightMap, model: &DropMesh, tol: f64) -> Result<Vec<Poly
     let margin = tol.max(0.05);
     let mut field = HeightMap { origin: rest.origin, cell: rest.cell, nx: rest.nx, ny: rest.ny, z: vec![-1.0; rest.z.len()] };
     let floor = model.bounds.min.z - 1.0;
-    for j in 0..rest.ny {
-        for i in 0..rest.nx {
-            let Some(top) = rest.get(i, j).filter(|z| z.is_finite()) else { continue };
-            let p = rest.point(i, j);
-            let part = model.drop_z(&probe, p, floor).map_or(floor, |c| c.z);
-            field.set(i, j, top - part - margin);
-        }
-    }
+    field.fill(|i, j, p, old| {
+        let Some(top) = rest.get(i, j).filter(|z| z.is_finite()) else { return old };
+        let part = model.drop_z(&probe, p, floor).map_or(floor, |c| c.z);
+        top - part - margin
+    });
     let loops: Vec<Poly> = field.contours(0.0).iter().map(|l| polyline::simplify_closed(l, rest.cell * 0.5)).filter(|l| l.len() >= 3).collect();
     Ok(polyline::normalize_set(&loops))
 }
